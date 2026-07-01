@@ -198,7 +198,7 @@ jobs:
       symbol_release_draft: true
       symbol_release_prefix: shine
       require_signpath_signing: false   # beam fork: no SignPath secrets — build unsigned
-      require_truehdr_runtime: false   # beam fork: no TrueHDR token
+      require_truehdr_runtime: true   # beam fork: pre-stage step falls back to github.token; skipping it breaks MSI packaging
     secrets:
       symbol_token: ${{ secrets.SYMBOL_TOKEN }}
       signpath_api_token: ${{ secrets.SIGNPATH_API_TOKEN }}

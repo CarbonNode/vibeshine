@@ -1157,6 +1157,18 @@ namespace webrtc_stream {
       return data;
     }
 
+    std::vector<uint8_t> make_rel_mouse_move_packet(std::int16_t dx, std::int16_t dy) {
+      NV_REL_MOUSE_MOVE_PACKET packet {};
+      packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+      packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_REL_MAGIC_GEN5);
+      packet.deltaX = util::endian::big(static_cast<short>(dx));
+      packet.deltaY = util::endian::big(static_cast<short>(dy));
+
+      std::vector<uint8_t> data(sizeof(packet));
+      std::memcpy(data.data(), &packet, sizeof(packet));
+      return data;
+    }
+
     std::vector<uint8_t> make_mouse_button_packet(int button, bool release) {
       NV_MOUSE_BUTTON_PACKET packet {};
       packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
@@ -1350,6 +1362,19 @@ namespace webrtc_stream {
         const double x = message.value("x", 0.0);
         const double y = message.value("y", 0.0);
         input::passthrough(input_ctx, make_abs_mouse_move_packet(x, y));
+        return;
+      }
+      if (type == "mouse_move_rel") {
+        const double dx = message.value("dx", 0.0);
+        const double dy = message.value("dy", 0.0);
+        const auto clamp_delta = [](double v) {
+          return static_cast<std::int16_t>(std::clamp<long>(std::lround(v), -32768, 32767));
+        };
+        const auto cdx = clamp_delta(dx);
+        const auto cdy = clamp_delta(dy);
+        if (cdx != 0 || cdy != 0) {
+          input::passthrough(input_ctx, make_rel_mouse_move_packet(cdx, cdy));
+        }
         return;
       }
       if (type == "mouse_down" || type == "mouse_up") {
@@ -2746,6 +2771,8 @@ namespace webrtc_stream {
 
     constexpr std::uint8_t kInputBinaryMouseMove = 1;
     constexpr std::size_t kInputBinaryMouseMoveSize = 1 + 2 + 2 + 2;
+    constexpr std::uint8_t kInputBinaryMouseMoveRel = 2;
+    constexpr std::size_t kInputBinaryMouseMoveRelSize = 1 + 2 + 2;
     constexpr auto kMouseMoveSeqResetIdle = std::chrono::milliseconds {1000};
 
     bool seq_newer_u16(std::uint16_t seq, std::uint16_t last) {
@@ -2770,6 +2797,17 @@ namespace webrtc_stream {
       }
 
       const auto type = buffer[0];
+      if (type == kInputBinaryMouseMoveRel) {
+        if (length < kInputBinaryMouseMoveRelSize) {
+          return;
+        }
+        const auto dx = static_cast<std::int16_t>(static_cast<std::uint16_t>(buffer[1]) | (static_cast<std::uint16_t>(buffer[2]) << 8));
+        const auto dy = static_cast<std::int16_t>(static_cast<std::uint16_t>(buffer[3]) | (static_cast<std::uint16_t>(buffer[4]) << 8));
+        if (dx != 0 || dy != 0) {
+          input::passthrough(input_ctx, make_rel_mouse_move_packet(dx, dy));
+        }
+        return;
+      }
       if (type != kInputBinaryMouseMove || length < kInputBinaryMouseMoveSize) {
         return;
       }

@@ -190,7 +190,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci-windows.yml
     with:
-      release_commit: ${{ needs.release-candidate.outputs.release_commit || github.sha }}
+      release_commit: ${{ github.sha }}   # beam fork: ALWAYS build the dispatched commit — the resolver picked a foreign SHA and shipped an unpatched binary
       release_version: ${{ needs.release-candidate.outputs.release_version || '0.0.0' }}
       release_tag: ${{ needs.release-candidate.outputs.tag_name }}
       symbol_product_name: Vibeshine

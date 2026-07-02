@@ -190,15 +190,15 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci-windows.yml
     with:
-      release_commit: ${{ needs.release-candidate.outputs.release_commit || github.sha }}
+      release_commit: ${{ github.sha }}   # beam: ALWAYS build the dispatched commit
       release_version: ${{ needs.release-candidate.outputs.release_version || '0.0.0' }}
       release_tag: ${{ needs.release-candidate.outputs.tag_name }}
       symbol_product_name: Vibeshine
       publish_symbols: ${{ needs.release-candidate.outputs.should_release == 'true' }}
       symbol_release_draft: true
       symbol_release_prefix: shine
-      require_signpath_signing: ${{ needs.release-candidate.outputs.should_release == 'true' }}
-      require_truehdr_runtime: ${{ needs.release-candidate.outputs.should_release == 'true' }}
+      require_signpath_signing: false   # beam fork: no SignPath secrets
+      require_truehdr_runtime: true   # beam fork: pre-stage falls back to github.token; skipping breaks cpack
     secrets:
       symbol_token: ${{ secrets.SYMBOL_TOKEN }}
       signpath_api_token: ${{ secrets.SIGNPATH_API_TOKEN }}

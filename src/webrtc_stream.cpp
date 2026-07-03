@@ -725,7 +725,6 @@ namespace webrtc_stream {
       std::atomic_bool feedback_shutdown {false};
       std::thread clipboard_thread;
       std::atomic_bool clipboard_shutdown {false};
-      std::atomic<unsigned long> last_clipboard_seq {0};
       std::optional<int> app_id;
       std::optional<WebRtcCaptureConfigKey> config_key;
       std::optional<WebRtcStreamStartParams> stream_start_params;
@@ -1349,6 +1348,13 @@ namespace webrtc_stream {
 #ifdef _WIN32
     // ── Beam clipboard bridge ── sync the host (Windows) clipboard with the browser.
     // UTF-8 on the wire; CF_UNICODETEXT (UTF-16) on the host.
+    // Last host clipboard sequence number already accounted for (either broadcast by the
+    // watcher or caused by the browser->host setter) — echo suppression. Declared here,
+    // before BOTH users: handle_input_message (below) and clipboard_thread_main (the
+    // webrtc_capture instance itself is declared later, so it cannot host this field for
+    // the earlier function).
+    std::atomic<unsigned long> beam_last_clipboard_seq {0};
+
     static std::wstring beam_utf8_to_wide(const std::string &utf8) {
       if (utf8.empty()) {
         return std::wstring();
@@ -1438,7 +1444,7 @@ namespace webrtc_stream {
 #ifdef _WIN32
         const std::string beam_clip_text = message.value("text", "");
         if (beam_set_host_clipboard(beam_clip_text)) {
-          webrtc_capture.last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
+          beam_last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
         }
 #endif
         return;
@@ -1828,20 +1834,20 @@ namespace webrtc_stream {
 
     // Poll the host clipboard; when it changes (and the change wasn't one we just applied from
     // the browser), push the new text to the browser as {type:"clipboard",text:...}. Echo is
-    // suppressed via last_clipboard_seq, which the browser->host path also updates.
+    // suppressed via beam_last_clipboard_seq, which the browser->host path also updates.
     void clipboard_thread_main() {
       using namespace std::chrono_literals;
-      webrtc_capture.last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
+      beam_last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
       while (!webrtc_capture.clipboard_shutdown.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(250ms);
         if (webrtc_capture.clipboard_shutdown.load(std::memory_order_acquire)) {
           break;
         }
         unsigned long seq = GetClipboardSequenceNumber();
-        if (seq == webrtc_capture.last_clipboard_seq.load(std::memory_order_acquire)) {
+        if (seq == beam_last_clipboard_seq.load(std::memory_order_acquire)) {
           continue;
         }
-        webrtc_capture.last_clipboard_seq.store(seq, std::memory_order_release);
+        beam_last_clipboard_seq.store(seq, std::memory_order_release);
         auto text = beam_get_host_clipboard();
         if (!text || text->empty()) {
           continue;

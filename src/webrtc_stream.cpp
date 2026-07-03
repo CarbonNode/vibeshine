@@ -725,6 +725,8 @@ namespace webrtc_stream {
       std::atomic_bool feedback_shutdown {false};
       std::thread clipboard_thread;
       std::atomic_bool clipboard_shutdown {false};
+      std::thread cursor_thread;
+      std::atomic_bool cursor_shutdown {false};
       std::optional<int> app_id;
       std::optional<WebRtcCaptureConfigKey> config_key;
       std::optional<WebRtcStreamStartParams> stream_start_params;
@@ -1428,7 +1430,25 @@ namespace webrtc_stream {
     }
 #endif
 
-    void handle_input_message(std::string_view payload) {
+    // Beam: this context is defined up here (not with the other Session* contexts in the
+    // SUNSHINE_ENABLE_WEBRTC block further down) because handle_input_message takes it as
+    // a parameter and dereferences it. Plain std:: members only — no lwrtc dependency —
+    // so it is safe to define unconditionally.
+    struct SessionDataChannelContext {
+      std::string id;
+      std::atomic<bool> active {true};
+      std::atomic<bool> mouse_move_seq_initialized {false};
+      std::atomic<std::uint16_t> last_mouse_move_seq {0};
+      std::atomic<std::int64_t> last_mouse_move_at_ms {0};
+      // Beam client-side cursor: this session asked us to EXCLUDE the composited host
+      // cursor from its video (it renders a local arrow from cursor_shape messages).
+      std::atomic<bool> client_cursor {false};
+      // Beam: push current cursor_state + cursor_shape to this session on the watcher's
+      // next tick (set on client_cursor changes and on input-channel (re)open).
+      std::atomic<bool> cursor_resync {false};
+    };
+
+    void handle_input_message(SessionDataChannelContext *beam_dc_ctx, std::string_view payload) {
       if (payload.empty()) {
         return;
       }
@@ -1447,6 +1467,19 @@ namespace webrtc_stream {
           beam_last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
         }
 #endif
+        return;
+      }
+
+      // Beam: client-side cursor opt-in/out (CRD-style local arrow in desktop mode).
+      // Needs no input context; the cursor watcher applies the effect and pushes
+      // cursor_state/cursor_shape back to the session.
+      if (beam_msg_type == "client_cursor") {
+        if (beam_dc_ctx) {
+          const bool beam_cursor_enabled = message.value("enabled", false);
+          beam_dc_ctx->client_cursor.store(beam_cursor_enabled, std::memory_order_release);
+          beam_dc_ctx->cursor_resync.store(true, std::memory_order_release);
+          BOOST_LOG(info) << "WebRTC: client_cursor " << (beam_cursor_enabled ? "enabled" : "disabled") << " (session " << beam_dc_ctx->id << ')';
+        }
         return;
       }
 
@@ -1629,14 +1662,6 @@ namespace webrtc_stream {
     struct SessionIceContext {
       std::string id;
       std::atomic<bool> active {true};
-    };
-
-    struct SessionDataChannelContext {
-      std::string id;
-      std::atomic<bool> active {true};
-      std::atomic<bool> mouse_move_seq_initialized {false};
-      std::atomic<std::uint16_t> last_mouse_move_seq {0};
-      std::atomic<std::int64_t> last_mouse_move_at_ms {0};
     };
 
     struct SessionKeyframeContext {
@@ -1857,6 +1882,269 @@ namespace webrtc_stream {
         payload["text"] = *text;
         send_input_channel_text(payload.dump());
       }
+    }
+#endif
+
+#if defined(SUNSHINE_ENABLE_WEBRTC) && defined(_WIN32)
+    // ── Beam client-side cursor (CRD-style local arrow) ─────────────────────────────
+    // Desktop mode in the browser renders the HOST cursor from the video, one full
+    // pipeline latency behind the hand ("floaty"). Chrome Remote Desktop solves this by
+    // drawing the cursor CLIENT-side at zero latency. Server half of that architecture:
+    //   • {type:"client_cursor",enabled} (browser→host, handle_input_message) marks the
+    //     session as rendering its own arrow.
+    //   • While ≥1 session opted in AND no other consumer still needs the baked-in
+    //     cursor (no Moonlight session — Bobcade! — and no stock WebRTC session), the
+    //     capture mirror beam_effective_display_cursor is forced false → DXGI frames
+    //     ship cursor-free. The capture is SHARED (one capture thread feeds every
+    //     consumer), so exclusion is only safe when it is unanimous; otherwise
+    //     compositing stays ON and opted-in clients are told via cursor_state so they
+    //     fall back to the stock behavior (no double / no missing cursor; Moonlight
+    //     stays byte-identical).
+    //   • {type:"cursor_state",composited} (host→browser) on enable/resync + on flips.
+    //   • {type:"cursor_shape",visible,w,h,hotX,hotY,data} (host→browser) on enable and
+    //     whenever the pointer shape or visibility changes. data = base64 BGRA rows,
+    //     top-down, w*4 bytes/row, straight (non-premultiplied) alpha. Monochrome and
+    //     inverting cursors are rasterized via the classic double-draw (black + white
+    //     backgrounds) alpha extraction — the same approximation CRD uses.
+    struct BeamCursorImage {
+      int width = 0;
+      int height = 0;
+      int hot_x = 0;
+      int hot_y = 0;
+      std::vector<std::uint8_t> bgra;
+    };
+
+    static std::string beam_base64(const std::uint8_t *data, std::size_t len) {
+      static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::string out;
+      out.reserve(((len + 2) / 3) * 4);
+      std::size_t i = 0;
+      for (; i + 3 <= len; i += 3) {
+        const std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) | (static_cast<std::uint32_t>(data[i + 1]) << 8) | data[i + 2];
+        out.push_back(kTable[(v >> 18) & 63]);
+        out.push_back(kTable[(v >> 12) & 63]);
+        out.push_back(kTable[(v >> 6) & 63]);
+        out.push_back(kTable[v & 63]);
+      }
+      if (i + 1 == len) {
+        const std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
+        out.push_back(kTable[(v >> 18) & 63]);
+        out.push_back(kTable[(v >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+      } else if (i + 2 == len) {
+        const std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) | (static_cast<std::uint32_t>(data[i + 1]) << 8);
+        out.push_back(kTable[(v >> 18) & 63]);
+        out.push_back(kTable[(v >> 12) & 63]);
+        out.push_back(kTable[(v >> 6) & 63]);
+        out.push_back('=');
+      }
+      return out;
+    }
+
+    static bool beam_capture_cursor_image(HCURSOR cursor, BeamCursorImage &out) {
+      ICONINFO info {};
+      if (!GetIconInfo(cursor, &info)) {
+        return false;
+      }
+      // GetIconInfo hands us bitmaps we own; take what we need, then free them.
+      BITMAP mask_bm {};
+      const bool have_mask = GetObjectW(info.hbmMask, sizeof(mask_bm), &mask_bm) != 0;
+      const bool have_color = info.hbmColor != nullptr;
+      const int width = have_mask ? static_cast<int>(mask_bm.bmWidth) : 0;
+      const int height = have_mask ? (have_color ? static_cast<int>(mask_bm.bmHeight) : static_cast<int>(mask_bm.bmHeight) / 2) : 0;
+      const int hot_x = static_cast<int>(info.xHotspot);
+      const int hot_y = static_cast<int>(info.yHotspot);
+      if (info.hbmColor) {
+        DeleteObject(info.hbmColor);
+      }
+      if (info.hbmMask) {
+        DeleteObject(info.hbmMask);
+      }
+      if (width <= 0 || height <= 0 || width > 256 || height > 256) {
+        return false;
+      }
+
+      HDC screen_dc = GetDC(nullptr);
+      if (!screen_dc) {
+        return false;
+      }
+      HDC mem_dc = CreateCompatibleDC(screen_dc);
+      if (!mem_dc) {
+        ReleaseDC(nullptr, screen_dc);
+        return false;
+      }
+
+      BITMAPINFO bmi {};
+      bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+      bmi.bmiHeader.biWidth = width;
+      bmi.bmiHeader.biHeight = -height;  // negative = top-down rows
+      bmi.bmiHeader.biPlanes = 1;
+      bmi.bmiHeader.biBitCount = 32;
+      bmi.bmiHeader.biCompression = BI_RGB;
+
+      void *black_bits = nullptr;
+      void *white_bits = nullptr;
+      HBITMAP black_bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &black_bits, nullptr, 0);
+      HBITMAP white_bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &white_bits, nullptr, 0);
+      bool ok = false;
+      if (black_bmp && white_bmp && black_bits && white_bits) {
+        const std::size_t byte_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+        const auto draw_onto = [&](HBITMAP bmp, void *bits, std::uint8_t fill) {
+          std::memset(bits, fill, byte_count);
+          HGDIOBJ prev = SelectObject(mem_dc, bmp);
+          const BOOL drawn = DrawIconEx(mem_dc, 0, 0, cursor, width, height, 0, nullptr, DI_NORMAL);
+          SelectObject(mem_dc, prev);
+          return drawn != FALSE;
+        };
+        if (draw_onto(black_bmp, black_bits, 0x00) && draw_onto(white_bmp, white_bits, 0xFF)) {
+          GdiFlush();
+          out.width = width;
+          out.height = height;
+          out.hot_x = hot_x;
+          out.hot_y = hot_y;
+          out.bgra.assign(byte_count, 0);
+          const auto *black = static_cast<const std::uint8_t *>(black_bits);
+          const auto *white = static_cast<const std::uint8_t *>(white_bits);
+          for (std::size_t px = 0; px < byte_count; px += 4) {
+            const int rb = black[px + 2];
+            const int rw = white[px + 2];
+            int alpha = 255 - (rw - rb);
+            if (alpha < 0) {
+              alpha = 0;
+            }
+            if (alpha > 255) {
+              alpha = 255;  // inverting (XOR) pixels land here — rendered as the black-bg appearance
+            }
+            if (alpha > 0) {
+              // un-premultiply the black render so the client gets straight alpha
+              const auto unmul = [&](int c) {
+                const int v = (c * 255 + alpha / 2) / alpha;
+                return static_cast<std::uint8_t>(v > 255 ? 255 : v);
+              };
+              out.bgra[px + 0] = unmul(black[px + 0]);
+              out.bgra[px + 1] = unmul(black[px + 1]);
+              out.bgra[px + 2] = unmul(black[px + 2]);
+              out.bgra[px + 3] = static_cast<std::uint8_t>(alpha);
+            }
+          }
+          ok = true;
+        }
+      }
+      if (black_bmp) {
+        DeleteObject(black_bmp);
+      }
+      if (white_bmp) {
+        DeleteObject(white_bmp);
+      }
+      DeleteDC(mem_dc);
+      ReleaseDC(nullptr, screen_dc);
+      return ok;
+    }
+
+    void beam_cursor_thread_main() {
+      using namespace std::chrono_literals;
+      BOOST_LOG(info) << "Beam cursor watcher active (build beamcur1): client_cursor / cursor_state / cursor_shape";
+      HCURSOR last_handle = nullptr;
+      bool last_visible = false;
+      bool have_last_shape = false;
+      bool last_composited = true;
+      bool have_composited = false;
+      std::string shape_payload;
+      std::string state_payload;
+      while (!webrtc_capture.cursor_shutdown.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(50ms);
+        if (webrtc_capture.cursor_shutdown.load(std::memory_order_acquire)) {
+          break;
+        }
+
+        // 1) unanimous-opt-out accounting → capture-facing mirror
+        std::size_t enabled_count = 0;
+        std::size_t wanting_count = 0;
+        {
+          std::lock_guard lg {session_mutex};
+          for (auto &[_, session] : sessions) {
+            const auto &dc_ctx = session.data_channel_context;
+            if (!dc_ctx || !dc_ctx->active.load(std::memory_order_acquire)) {
+              continue;
+            }
+            if (dc_ctx->client_cursor.load(std::memory_order_acquire)) {
+              ++enabled_count;
+            } else {
+              ++wanting_count;
+            }
+          }
+        }
+        const bool suppress = enabled_count > 0 && wanting_count == 0 && rtsp_stream::session_count() == 0;
+        beam_effective_display_cursor = display_cursor && !suppress;
+        const bool composited = beam_effective_display_cursor;
+        const bool composited_changed = !have_composited || composited != last_composited;
+        if (composited_changed) {
+          nlohmann::json state;
+          state["type"] = "cursor_state";
+          state["composited"] = composited;
+          state_payload = state.dump();
+          last_composited = composited;
+          have_composited = true;
+        }
+
+        // 2) pointer shape / visibility
+        CURSORINFO ci {};
+        ci.cbSize = sizeof(ci);
+        bool visible = false;
+        HCURSOR handle = nullptr;
+        if (GetCursorInfo(&ci)) {
+          visible = (ci.flags & CURSOR_SHOWING) != 0;
+          handle = ci.hCursor;
+        }
+        const bool shape_changed = !have_last_shape || visible != last_visible || (visible && handle != last_handle);
+        if (shape_changed) {
+          nlohmann::json shape;
+          shape["type"] = "cursor_shape";
+          shape["visible"] = visible;
+          if (visible && handle) {
+            BeamCursorImage img;
+            if (beam_capture_cursor_image(handle, img)) {
+              shape["w"] = img.width;
+              shape["h"] = img.height;
+              shape["hotX"] = img.hot_x;
+              shape["hotY"] = img.hot_y;
+              shape["data"] = beam_base64(img.bgra.data(), img.bgra.size());
+            }
+            // capture failure → visible without data; the client falls back to its
+            // default arrow rather than losing the cursor entirely
+          }
+          shape_payload = shape.dump();
+          last_handle = handle;
+          last_visible = visible;
+          have_last_shape = true;
+        }
+
+        // 3) deliver — changed payloads to every opted-in session, cached payloads to
+        //    sessions flagged for resync (fresh enable / channel reopen)
+        if (state_payload.empty() && shape_payload.empty()) {
+          continue;
+        }
+        std::lock_guard lg {session_mutex};
+        for (auto &[_, session] : sessions) {
+          const auto &dc_ctx = session.data_channel_context;
+          if (!dc_ctx || !dc_ctx->active.load(std::memory_order_acquire) || !dc_ctx->client_cursor.load(std::memory_order_acquire)) {
+            continue;
+          }
+          if (!session.input_channel || lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
+            continue;
+          }
+          const bool resync = dc_ctx->cursor_resync.exchange(false, std::memory_order_acq_rel);
+          if ((composited_changed || resync) && !state_payload.empty()) {
+            lwrtc_data_channel_send(session.input_channel, reinterpret_cast<const uint8_t *>(state_payload.data()), state_payload.size(), 0);
+          }
+          if ((shape_changed || resync) && !shape_payload.empty()) {
+            lwrtc_data_channel_send(session.input_channel, reinterpret_cast<const uint8_t *>(shape_payload.data()), shape_payload.size(), 0);
+          }
+        }
+      }
+      // watcher gone → nothing may suppress; restore the plain mirror
+      beam_effective_display_cursor = display_cursor;
     }
 #endif
 
@@ -2650,6 +2938,10 @@ namespace webrtc_stream {
       if (webrtc_capture.clipboard_thread.joinable()) {
         webrtc_capture.clipboard_thread.join();
       }
+      webrtc_capture.cursor_shutdown.store(true, std::memory_order_release);
+      if (webrtc_capture.cursor_thread.joinable()) {
+        webrtc_capture.cursor_thread.join();
+      }
       if (webrtc_capture.video_thread.joinable()) {
         webrtc_capture.video_thread.join();
       }
@@ -2875,6 +3167,7 @@ namespace webrtc_stream {
       webrtc_capture.config_key = desired_key;
       webrtc_capture.feedback_shutdown.store(false, std::memory_order_release);
       webrtc_capture.clipboard_shutdown.store(false, std::memory_order_release);
+      webrtc_capture.cursor_shutdown.store(false, std::memory_order_release);
       #ifdef SUNSHINE_ENABLE_WEBRTC
       webrtc_capture.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
       webrtc_capture.feedback_thread = std::thread([queue = webrtc_capture.feedback_queue]() {
@@ -2883,6 +3176,9 @@ namespace webrtc_stream {
       #ifdef _WIN32
       webrtc_capture.clipboard_thread = std::thread([]() {
         clipboard_thread_main();
+      });
+      webrtc_capture.cursor_thread = std::thread([]() {
+        beam_cursor_thread_main();
       });
 #endif
 #endif
@@ -3013,7 +3309,7 @@ namespace webrtc_stream {
         );
         return;
       }
-      handle_input_message(std::string_view {buffer, static_cast<std::size_t>(length)});
+      handle_input_message(static_cast<SessionDataChannelContext *>(user), std::string_view {buffer, static_cast<std::size_t>(length)});
     }
 
     void on_data_channel(void *user, lwrtc_data_channel_t *channel) {
@@ -3049,6 +3345,7 @@ namespace webrtc_stream {
           it->second.data_channel_context->mouse_move_seq_initialized.store(false, std::memory_order_release);
           it->second.data_channel_context->last_mouse_move_seq.store(0, std::memory_order_release);
           it->second.data_channel_context->last_mouse_move_at_ms.store(0, std::memory_order_release);
+          it->second.data_channel_context->cursor_resync.store(true, std::memory_order_release);  // Beam: re-push cursor state/shape after channel (re)open
         }
         lwrtc_data_channel_register_observer(channel, nullptr, &on_data_channel_message, ctx);
       }

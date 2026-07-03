@@ -18,6 +18,23 @@ extern thread_pool_util::ThreadPool task_pool;
  */
 extern bool display_cursor;
 
+/**
+ * @brief Beam: the cursor flag the capture loops actually consume.
+ *
+ * Mirrors display_cursor, EXCEPT while every consumer of the (shared) capture has opted
+ * out of the composited cursor — i.e. at least one Beam WebRTC session requested
+ * client-side cursor rendering ({type:"client_cursor",enabled:true}) and there is no
+ * Moonlight session and no stock WebRTC session left that still needs the cursor baked
+ * into the video. Then it is forced false so DXGI desktop-duplication frames ship
+ * cursor-free (DXGI delivers the pointer separately; skipping our blend is lossless and
+ * reversible).
+ *
+ * Maintained by webrtc_stream's cursor watcher thread (Windows). Any code that toggles
+ * display_cursor must mirror the new value into this flag (input.cpp does) — the watcher
+ * re-applies suppression on its next tick when it is running.
+ */
+extern bool beam_effective_display_cursor;
+
 #ifdef _WIN32
   // Declare global singleton used for NVIDIA control panel modifications
   #include "platform/windows/nvprefs/nvprefs_interface.h"

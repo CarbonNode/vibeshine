@@ -251,6 +251,7 @@ list(PREPEND PLATFORM_LIBRARIES
         D3DCompiler
         dwmapi
         dxgi
+        gdi32
         iphlpapi
         ksuser
         libssp.a

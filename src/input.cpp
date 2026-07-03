@@ -302,6 +302,9 @@ namespace input {
     switch (keyCode) {
       case 0x4E /* VKEY_N */:
         display_cursor = !display_cursor;
+        // Beam: keep the capture-facing mirror in sync (webrtc_stream's cursor watcher
+        // re-applies client_cursor suppression on its next tick when it is running).
+        beam_effective_display_cursor = display_cursor;
         return 1;
     }
 

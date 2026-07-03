@@ -1949,7 +1949,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &beam_effective_display_cursor);  // Beam: mirror of display_cursor, forced false only when EVERY consumer opted out of the composited cursor (see globals.h)
 
       if (artificial_reinit && status != platf::capture_e::error) {
         status = platf::capture_e::reinit;
@@ -3231,7 +3231,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &beam_effective_display_cursor);  // Beam: mirror of display_cursor, forced false only when EVERY consumer opted out of the composited cursor (see globals.h)
       switch (status) {
         case platf::capture_e::reinit:
         case platf::capture_e::error:

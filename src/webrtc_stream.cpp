@@ -33,6 +33,7 @@
 
 #ifdef _WIN32
   #include <winsock2.h>
+  #include <windows.h>
   #include "platform/windows/display.h"
 #endif
 
@@ -722,6 +723,9 @@ namespace webrtc_stream {
       std::thread feedback_thread;
       safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> feedback_queue;
       std::atomic_bool feedback_shutdown {false};
+      std::thread clipboard_thread;
+      std::atomic_bool clipboard_shutdown {false};
+      std::atomic<unsigned long> last_clipboard_seq {0};
       std::optional<int> app_id;
       std::optional<WebRtcCaptureConfigKey> config_key;
       std::optional<WebRtcStreamStartParams> stream_start_params;
@@ -1342,6 +1346,82 @@ namespace webrtc_stream {
       return 0;
     }
 
+#ifdef _WIN32
+    // ── Beam clipboard bridge ── sync the host (Windows) clipboard with the browser.
+    // UTF-8 on the wire; CF_UNICODETEXT (UTF-16) on the host.
+    static std::wstring beam_utf8_to_wide(const std::string &utf8) {
+      if (utf8.empty()) {
+        return std::wstring();
+      }
+      int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+      if (n <= 0) {
+        return std::wstring();
+      }
+      std::wstring wide(static_cast<size_t>(n), L'\0');
+      MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), n);
+      return wide;
+    }
+
+    static std::string beam_wide_to_utf8(const wchar_t *wide, int wlen) {
+      if (!wide || wlen <= 0) {
+        return std::string();
+      }
+      int n = WideCharToMultiByte(CP_UTF8, 0, wide, wlen, nullptr, 0, nullptr, nullptr);
+      if (n <= 0) {
+        return std::string();
+      }
+      std::string utf8(static_cast<size_t>(n), '\0');
+      WideCharToMultiByte(CP_UTF8, 0, wide, wlen, utf8.data(), n, nullptr, nullptr);
+      return utf8;
+    }
+
+    static bool beam_set_host_clipboard(const std::string &utf8) {
+      std::wstring wide = beam_utf8_to_wide(utf8);
+      if (!OpenClipboard(nullptr)) {
+        return false;
+      }
+      bool ok = false;
+      EmptyClipboard();
+      HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, (wide.size() + 1) * sizeof(wchar_t));
+      if (handle) {
+        void *dst = GlobalLock(handle);
+        if (dst) {
+          std::memcpy(dst, wide.c_str(), (wide.size() + 1) * sizeof(wchar_t));
+          GlobalUnlock(handle);
+          if (SetClipboardData(CF_UNICODETEXT, handle)) {
+            ok = true;  // the clipboard now owns `handle`
+          } else {
+            GlobalFree(handle);
+          }
+        } else {
+          GlobalFree(handle);
+        }
+      }
+      CloseClipboard();
+      return ok;
+    }
+
+    static std::optional<std::string> beam_get_host_clipboard() {
+      if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        return std::nullopt;
+      }
+      if (!OpenClipboard(nullptr)) {
+        return std::nullopt;
+      }
+      std::optional<std::string> result;
+      HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+      if (handle) {
+        const wchar_t *wide = static_cast<const wchar_t *>(GlobalLock(handle));
+        if (wide) {
+          result = beam_wide_to_utf8(wide, static_cast<int>(wcslen(wide)));
+          GlobalUnlock(handle);
+        }
+      }
+      CloseClipboard();
+      return result;
+    }
+#endif
+
     void handle_input_message(std::string_view payload) {
       if (payload.empty()) {
         return;
@@ -1349,6 +1429,18 @@ namespace webrtc_stream {
 
       auto message = nlohmann::json::parse(payload.begin(), payload.end(), nullptr, false);
       if (message.is_discarded()) {
+        return;
+      }
+
+      // Clipboard write (browser -> host) does not need an input context; handle it first.
+      const auto beam_msg_type = message.value("type", "");
+      if (beam_msg_type == "clipboard_set") {
+#ifdef _WIN32
+        const std::string beam_clip_text = message.value("text", "");
+        if (beam_set_host_clipboard(beam_clip_text)) {
+          webrtc_capture.last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
+        }
+#endif
         return;
       }
 
@@ -1710,6 +1802,54 @@ namespace webrtc_stream {
           payload.size(),
           0
         );
+      }
+    }
+#endif
+
+#if defined(SUNSHINE_ENABLE_WEBRTC) && defined(_WIN32)
+    // Broadcast a text payload (e.g. host clipboard) to every open input DataChannel.
+    void send_input_channel_text(const std::string &payload) {
+      std::lock_guard lg {session_mutex};
+      for (auto &[_, session] : sessions) {
+        if (!session.input_channel) {
+          continue;
+        }
+        if (lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
+          continue;
+        }
+        lwrtc_data_channel_send(
+          session.input_channel,
+          reinterpret_cast<const uint8_t *>(payload.data()),
+          payload.size(),
+          0
+        );
+      }
+    }
+
+    // Poll the host clipboard; when it changes (and the change wasn't one we just applied from
+    // the browser), push the new text to the browser as {type:"clipboard",text:...}. Echo is
+    // suppressed via last_clipboard_seq, which the browser->host path also updates.
+    void clipboard_thread_main() {
+      using namespace std::chrono_literals;
+      webrtc_capture.last_clipboard_seq.store(GetClipboardSequenceNumber(), std::memory_order_release);
+      while (!webrtc_capture.clipboard_shutdown.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(250ms);
+        if (webrtc_capture.clipboard_shutdown.load(std::memory_order_acquire)) {
+          break;
+        }
+        unsigned long seq = GetClipboardSequenceNumber();
+        if (seq == webrtc_capture.last_clipboard_seq.load(std::memory_order_acquire)) {
+          continue;
+        }
+        webrtc_capture.last_clipboard_seq.store(seq, std::memory_order_release);
+        auto text = beam_get_host_clipboard();
+        if (!text || text->empty()) {
+          continue;
+        }
+        nlohmann::json payload;
+        payload["type"] = "clipboard";
+        payload["text"] = *text;
+        send_input_channel_text(payload.dump());
       }
     }
 #endif
@@ -2500,6 +2640,10 @@ namespace webrtc_stream {
       if (webrtc_capture.feedback_thread.joinable()) {
         webrtc_capture.feedback_thread.join();
       }
+      webrtc_capture.clipboard_shutdown.store(true, std::memory_order_release);
+      if (webrtc_capture.clipboard_thread.joinable()) {
+        webrtc_capture.clipboard_thread.join();
+      }
       if (webrtc_capture.video_thread.joinable()) {
         webrtc_capture.video_thread.join();
       }
@@ -2724,11 +2868,17 @@ namespace webrtc_stream {
       webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
       webrtc_capture.config_key = desired_key;
       webrtc_capture.feedback_shutdown.store(false, std::memory_order_release);
+      webrtc_capture.clipboard_shutdown.store(false, std::memory_order_release);
       #ifdef SUNSHINE_ENABLE_WEBRTC
       webrtc_capture.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
       webrtc_capture.feedback_thread = std::thread([queue = webrtc_capture.feedback_queue]() {
         feedback_thread_main(queue);
       });
+      #ifdef _WIN32
+      webrtc_capture.clipboard_thread = std::thread([]() {
+        clipboard_thread_main();
+      });
+#endif
 #endif
       webrtc_capture.active.store(true, std::memory_order_release);
 

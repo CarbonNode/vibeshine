@@ -2054,15 +2054,105 @@ namespace webrtc_stream {
       return ok;
     }
 
+    // ── OS-level host-cursor hider ──────────────────────────────────────────────────
+    // WHY THIS EXISTS (the ghost, root-caused): super_server streams a VIRTUAL display
+    // (IddCx VDD). On displays without a hardware cursor plane Windows SOFTWARE-composes
+    // the pointer into the desktop image itself, so DXGI duplication frames arrive with
+    // the cursor ALREADY BAKED IN and FrameInfo.PointerShape* stays empty — Sunshine's
+    // cursor blend (and therefore beam_effective_display_cursor) never had any effect in
+    // either direction on this box. Skipping the blend was correct but gated a no-op.
+    // The fix that works for BOTH display classes: while suppression is engaged, stop the
+    // host from RENDERING the pointer at all — MagShowSystemCursor(FALSE) (Magnification
+    // API; also used by capture tools for exactly this). GetCursorInfo/GetIconInfo keep
+    // reporting the logical cursor, so the cursor_shape channel keeps streaming the real
+    // shape to the client. Loaded dynamically: zero new link dependencies.
+    // Failsafes: restored on suppression release, on watcher shutdown, and once at
+    // watcher boot (a crash while hidden must not leave a cursorless host).
+    struct BeamMagHider {
+      HMODULE lib = nullptr;
+      BOOL(WINAPI *mag_init)() = nullptr;
+      BOOL(WINAPI *mag_uninit)() = nullptr;
+      BOOL(WINAPI *mag_show)(BOOL) = nullptr;
+      bool initialized = false;
+      bool hidden = false;
+      bool failed_logged = false;
+
+      bool load() {
+        if (initialized) {
+          return true;
+        }
+        if (!lib) {
+          lib = LoadLibraryW(L"Magnification.dll");
+        }
+        if (!lib) {
+          return false;
+        }
+        mag_init = reinterpret_cast<BOOL(WINAPI *)()>(reinterpret_cast<void *>(GetProcAddress(lib, "MagInitialize")));
+        mag_uninit = reinterpret_cast<BOOL(WINAPI *)()>(reinterpret_cast<void *>(GetProcAddress(lib, "MagUninitialize")));
+        mag_show = reinterpret_cast<BOOL(WINAPI *)(BOOL)>(reinterpret_cast<void *>(GetProcAddress(lib, "MagShowSystemCursor")));
+        if (!mag_init || !mag_show) {
+          return false;
+        }
+        initialized = mag_init() != FALSE;
+        return initialized;
+      }
+
+      // on=true → hide the host cursor. Returns whether the desired state is in effect.
+      bool set_hidden(bool on) {
+        if (!load()) {
+          if (on && !failed_logged) {
+            failed_logged = true;
+            BOOST_LOG(warning) << "Beam cursor: Magnification API unavailable — cannot hide the host cursor at the OS layer; on software-cursor displays (VDD) frames will keep the baked-in cursor (reporting composited:true)";
+          }
+          return false;
+        }
+        if (hidden == on) {
+          return true;
+        }
+        if (mag_show(on ? FALSE : TRUE) == FALSE) {
+          if (on && !failed_logged) {
+            failed_logged = true;
+            BOOST_LOG(warning) << "Beam cursor: MagShowSystemCursor failed — cannot hide the host cursor at the OS layer";
+          }
+          return false;
+        }
+        hidden = on;
+        BOOST_LOG(info) << "Beam cursor: host cursor " << (on ? "HIDDEN at the OS layer (MagShowSystemCursor)" : "restored");
+        return true;
+      }
+
+      void shutdown() {
+        if (hidden && mag_show) {
+          mag_show(TRUE);
+          hidden = false;
+          BOOST_LOG(info) << "Beam cursor: host cursor restored (watcher shutdown)";
+        }
+        if (initialized && mag_uninit) {
+          mag_uninit();
+          initialized = false;
+        }
+      }
+    };
+
+    BeamMagHider beam_mag;
+
     void beam_cursor_thread_main() {
       using namespace std::chrono_literals;
-      BOOST_LOG(info) << "Beam cursor watcher active (build beamcur2): client_cursor / cursor_state / cursor_shape / zombie reaping";
+      BOOST_LOG(info) << "Beam cursor watcher active (build beamcur3): client_cursor / cursor_state / cursor_shape / zombie reaping / os-level cursor hide";
+      if (beam_mag.load()) {
+        beam_mag.set_hidden(false);   // restore any stale hide left by a crash while suppressed
+      }
       HCURSOR last_handle = nullptr;
       bool last_visible = false;
       bool have_last_shape = false;
       bool last_composited = true;
       bool have_composited = false;
       bool last_suppress_logged = false;
+      bool was_mag_engaged = false;
+      bool last_raw_visible = false;
+      HCURSOR last_raw_handle = nullptr;
+      bool pre_mag_visible = true;
+      HCURSOR pre_mag_handle = nullptr;
       std::string shape_payload;
       std::string state_payload;
       while (!webrtc_capture.cursor_shutdown.load(std::memory_order_acquire)) {
@@ -2126,16 +2216,28 @@ namespace webrtc_stream {
         }
         const int rtsp_count = rtsp_stream::session_count();
         const bool suppress = enabled_count > 0 && wanting_count == 0 && rtsp_count == 0;
-        beam_effective_display_cursor = display_cursor && !suppress;
-        // pixel truth: WGC composites the cursor in its helper session and ignores our
-        // flag — while WGC frames are flowing, never claim a cursor-free feed.
+        beam_effective_display_cursor = display_cursor && !suppress;   // still skips our blend on hardware-cursor displays (harmless no-op on software-cursor ones)
+        // THE pixel gate: stop the host from rendering the pointer at all. On the VDD
+        // (software-composed cursor) this is the ONLY thing that actually removes it from
+        // DXGI dup frames — the blend flag gated a blend that never ran there.
+        bool mag_engaged = false;
+        if (suppress) {
+          mag_engaged = beam_mag.set_hidden(true);
+        } else {
+          beam_mag.set_hidden(false);
+        }
+        // pixel truth: only claim a cursor-free feed when the OS-level hide is actually in
+        // effect AND WGC (which composites in its helper, ignoring everything) is not the
+        // live backend. A false 'composited' is a harmless fallback; a false 'cursor-free'
+        // is rober's ghost.
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const bool wgc_active = (now_ms - beam_wgc_last_snapshot_ms.load(std::memory_order_relaxed)) < 1500;
-        const bool composited = beam_effective_display_cursor || wgc_active;
+        const bool composited = !(suppress && mag_engaged && !wgc_active);
         if (suppress != last_suppress_logged || !have_composited) {
           BOOST_LOG(info) << "Beam cursor suppression " << (suppress ? "ENGAGED" : "released")
                           << " (webrtc opted-in=" << enabled_count << " wanting=" << wanting_count
                           << " doomed=" << doomed_count << " rtsp=" << rtsp_count
+                          << " os-hide=" << (suppress ? (mag_engaged ? "on" : "FAILED") : "off")
                           << (wgc_active ? " wgc-active" : "") << ")";
           if (suppress && wgc_active) {
             BOOST_LOG(warning) << "Beam cursor: suppression requested but the WGC capture backend bakes the cursor into frames (cursor_visible is ignored there) — reporting composited:true; switch capture to DXGI desktop duplication for client-side cursor";
@@ -2152,15 +2254,29 @@ namespace webrtc_stream {
           have_composited = true;
         }
 
-        // 2) pointer shape / visibility
+        // 2) pointer shape / visibility (raw reading + Mag compensation: if
+        //    MagShowSystemCursor also drops CURSOR_SHOWING on this Windows build, an
+        //    unchanged cursor handle right after WE hid it means "hidden by us", not an
+        //    app hiding its cursor — keep reporting visible so the client arrow stays.)
         CURSORINFO ci {};
         ci.cbSize = sizeof(ci);
-        bool visible = false;
+        bool raw_visible = false;
         HCURSOR handle = nullptr;
         if (GetCursorInfo(&ci)) {
-          visible = (ci.flags & CURSOR_SHOWING) != 0;
+          raw_visible = (ci.flags & CURSOR_SHOWING) != 0;
           handle = ci.hCursor;
         }
+        if (mag_engaged && !was_mag_engaged) {
+          pre_mag_visible = last_raw_visible;
+          pre_mag_handle = last_raw_handle;
+        }
+        bool visible = raw_visible;
+        if (mag_engaged && !raw_visible && pre_mag_visible && handle == pre_mag_handle) {
+          visible = true;
+        }
+        last_raw_visible = raw_visible;
+        last_raw_handle = handle;
+        was_mag_engaged = mag_engaged;
         const bool shape_changed = !have_last_shape || visible != last_visible || (visible && handle != last_handle);
         if (shape_changed) {
           nlohmann::json shape;
@@ -2207,7 +2323,8 @@ namespace webrtc_stream {
           }
         }
       }
-      // watcher gone → nothing may suppress; restore the plain mirror
+      // watcher gone → nothing may suppress; restore the plain mirror + the OS cursor
+      beam_mag.shutdown();
       beam_effective_display_cursor = display_cursor;
     }
 #endif

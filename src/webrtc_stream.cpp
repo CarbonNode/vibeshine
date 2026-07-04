@@ -1446,6 +1446,17 @@ namespace webrtc_stream {
       // Beam: push current cursor_state + cursor_shape to this session on the watcher's
       // next tick (set on client_cursor changes and on input-channel (re)open).
       std::atomic<bool> cursor_resync {false};
+      // Beam liveness: the input channel reached OPEN at least once…
+      std::atomic<bool> channel_open_seen {false};
+      // …and the channel-state callback (or the watcher's poll) saw it die. A doomed
+      // session must never veto cursor suppression and gets reaped off-thread — the
+      // zombie bug: killed tabs never send the HTTP close, and the fork registered NO
+      // state observer, so dead sessions sat in the map holding the encode seat and
+      // vetoing unanimity for minutes.
+      std::atomic<bool> doomed {false};
+      // Beam: reap task already enqueued for this session (close_session is idempotent,
+      // this just stops per-tick duplicate tasks + log spam until it lands).
+      std::atomic<bool> reap_enqueued {false};
     };
 
     void handle_input_message(SessionDataChannelContext *beam_dc_ctx, std::string_view payload) {
@@ -1700,6 +1711,7 @@ namespace webrtc_stream {
 
     struct Session {
       SessionState state;
+      std::chrono::steady_clock::time_point beam_created = std::chrono::steady_clock::now();  // Beam: age-gates never-connected zombies
       video::config_t video_config;
       ring_buffer_t<EncodedVideoFrame> video_frames {kMaxVideoFrames};
       ring_buffer_t<EncodedAudioFrame> audio_frames {kMaxAudioFrames};
@@ -2044,12 +2056,13 @@ namespace webrtc_stream {
 
     void beam_cursor_thread_main() {
       using namespace std::chrono_literals;
-      BOOST_LOG(info) << "Beam cursor watcher active (build beamcur1): client_cursor / cursor_state / cursor_shape";
+      BOOST_LOG(info) << "Beam cursor watcher active (build beamcur2): client_cursor / cursor_state / cursor_shape / zombie reaping";
       HCURSOR last_handle = nullptr;
       bool last_visible = false;
       bool have_last_shape = false;
       bool last_composited = true;
       bool have_composited = false;
+      bool last_suppress_logged = false;
       std::string shape_payload;
       std::string state_payload;
       while (!webrtc_capture.cursor_shutdown.load(std::memory_order_acquire)) {
@@ -2058,15 +2071,43 @@ namespace webrtc_stream {
           break;
         }
 
-        // 1) unanimous-opt-out accounting → capture-facing mirror
+        // 1) liveness sweep + unanimous-opt-out accounting → capture-facing mirror.
+        //    Only LIVE sessions get a vote: doomed ones (channel died — killed tab) are
+        //    collected and reaped below, and a session that never opened its channel
+        //    within the age gate is a negotiation zombie. Reaping frees the encode seat
+        //    (close_session → stop_webrtc_capture_if_idle) — the "encoder busy minutes
+        //    after tab close" bug — and unblocks cursor suppression.
         std::size_t enabled_count = 0;
         std::size_t wanting_count = 0;
+        std::size_t doomed_count = 0;
+        std::vector<std::string> reap_ids;
         {
           std::lock_guard lg {session_mutex};
-          for (auto &[_, session] : sessions) {
+          for (auto &[sid, session] : sessions) {
             const auto &dc_ctx = session.data_channel_context;
             if (!dc_ctx || !dc_ctx->active.load(std::memory_order_acquire)) {
               continue;
+            }
+            // belt: poll the channel state in case the close callback was missed
+            if (!dc_ctx->doomed.load(std::memory_order_acquire) &&
+                dc_ctx->channel_open_seen.load(std::memory_order_acquire) &&
+                session.input_channel &&
+                lwrtc_data_channel_state(session.input_channel) == LWRTC_DATA_CHANNEL_CLOSED) {
+              dc_ctx->doomed.store(true, std::memory_order_release);
+            }
+            // age gate: negotiated but never connected, and no channel ever opened
+            if (!dc_ctx->doomed.load(std::memory_order_acquire) &&
+                !dc_ctx->channel_open_seen.load(std::memory_order_acquire) &&
+                std::chrono::steady_clock::now() - session.beam_created > std::chrono::seconds(120)) {
+              dc_ctx->doomed.store(true, std::memory_order_release);
+              BOOST_LOG(info) << "WebRTC: session " << sid << " never opened its input channel within 120s — marked for reaping";
+            }
+            if (dc_ctx->doomed.load(std::memory_order_acquire)) {
+              ++doomed_count;
+              if (!dc_ctx->reap_enqueued.exchange(true, std::memory_order_acq_rel)) {
+                reap_ids.push_back(sid);
+              }
+              continue;  // a zombie must never veto suppression
             }
             if (dc_ctx->client_cursor.load(std::memory_order_acquire)) {
               ++enabled_count;
@@ -2075,9 +2116,32 @@ namespace webrtc_stream {
             }
           }
         }
-        const bool suppress = enabled_count > 0 && wanting_count == 0 && rtsp_stream::session_count() == 0;
+        for (const auto &rid : reap_ids) {
+          BOOST_LOG(info) << "WebRTC: reaping dead session " << rid;
+          // close_session can tear down the whole capture (stop_webrtc_capture_locked)
+          // which JOINS this very watcher thread — reap from the task pool, never inline.
+          task_pool.push([rid]() {
+            close_session(rid);
+          });
+        }
+        const int rtsp_count = rtsp_stream::session_count();
+        const bool suppress = enabled_count > 0 && wanting_count == 0 && rtsp_count == 0;
         beam_effective_display_cursor = display_cursor && !suppress;
-        const bool composited = beam_effective_display_cursor;
+        // pixel truth: WGC composites the cursor in its helper session and ignores our
+        // flag — while WGC frames are flowing, never claim a cursor-free feed.
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const bool wgc_active = (now_ms - beam_wgc_last_snapshot_ms.load(std::memory_order_relaxed)) < 1500;
+        const bool composited = beam_effective_display_cursor || wgc_active;
+        if (suppress != last_suppress_logged || !have_composited) {
+          BOOST_LOG(info) << "Beam cursor suppression " << (suppress ? "ENGAGED" : "released")
+                          << " (webrtc opted-in=" << enabled_count << " wanting=" << wanting_count
+                          << " doomed=" << doomed_count << " rtsp=" << rtsp_count
+                          << (wgc_active ? " wgc-active" : "") << ")";
+          if (suppress && wgc_active) {
+            BOOST_LOG(warning) << "Beam cursor: suppression requested but the WGC capture backend bakes the cursor into frames (cursor_visible is ignored there) — reporting composited:true; switch capture to DXGI desktop duplication for client-side cursor";
+          }
+          last_suppress_logged = suppress;
+        }
         const bool composited_changed = !have_composited || composited != last_composited;
         if (composited_changed) {
           nlohmann::json state;
@@ -2128,7 +2192,7 @@ namespace webrtc_stream {
         std::lock_guard lg {session_mutex};
         for (auto &[_, session] : sessions) {
           const auto &dc_ctx = session.data_channel_context;
-          if (!dc_ctx || !dc_ctx->active.load(std::memory_order_acquire) || !dc_ctx->client_cursor.load(std::memory_order_acquire)) {
+          if (!dc_ctx || !dc_ctx->active.load(std::memory_order_acquire) || !dc_ctx->client_cursor.load(std::memory_order_acquire) || dc_ctx->doomed.load(std::memory_order_acquire)) {
             continue;
           }
           if (!session.input_channel || lwrtc_data_channel_state(session.input_channel) != LWRTC_DATA_CHANNEL_OPEN) {
@@ -3297,6 +3361,27 @@ namespace webrtc_stream {
       input::passthrough(input_ctx, make_abs_mouse_move_packet(unit_from_u16(x_u16), unit_from_u16(y_u16)));
     }
 
+    void on_data_channel_state(void *user, int state) {
+      auto *ctx = static_cast<SessionDataChannelContext *>(user);
+      if (!ctx) {
+        return;
+      }
+      if (state == LWRTC_DATA_CHANNEL_OPEN) {
+        ctx->channel_open_seen.store(true, std::memory_order_release);
+        return;
+      }
+      if (state == LWRTC_DATA_CHANNEL_CLOSING || state == LWRTC_DATA_CHANNEL_CLOSED) {
+        // Transport death (killed tab, network loss) closes the SCTP channel via DTLS/ICE
+        // teardown inside libwebrtc — this callback is how the server finally hears it.
+        // Only mark; the watcher reaps OFF this thread (close_session releases lwrtc
+        // objects and must never run on an lwrtc callback thread).
+        if (ctx->active.load(std::memory_order_acquire)) {
+          ctx->doomed.store(true, std::memory_order_release);
+          BOOST_LOG(info) << "WebRTC: input channel " << (state == LWRTC_DATA_CHANNEL_CLOSED ? "closed" : "closing") << " for session " << ctx->id << " — marked for reaping";
+        }
+      }
+    }
+
     void on_data_channel_message(void *user, const char *buffer, int length, int binary) {
       if (!buffer || length <= 0) {
         return;
@@ -3346,8 +3431,9 @@ namespace webrtc_stream {
           it->second.data_channel_context->last_mouse_move_seq.store(0, std::memory_order_release);
           it->second.data_channel_context->last_mouse_move_at_ms.store(0, std::memory_order_release);
           it->second.data_channel_context->cursor_resync.store(true, std::memory_order_release);  // Beam: re-push cursor state/shape after channel (re)open
+          it->second.data_channel_context->doomed.store(false, std::memory_order_release);  // Beam: a fresh channel supersedes a stale close from the one it replaces
         }
-        lwrtc_data_channel_register_observer(channel, nullptr, &on_data_channel_message, ctx);
+        lwrtc_data_channel_register_observer(channel, &on_data_channel_state, &on_data_channel_message, ctx);
       }
     }
 

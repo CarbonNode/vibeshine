@@ -17,6 +17,7 @@
 #include "ipc/ipc_session.h"
 #include "ipc/misc_utils.h"
 #include "src/logging.h"
+#include "src/globals.h"
 #include "src/platform/windows/display.h"
 #include "src/platform/windows/display_vram.h"
 #include "src/platform/windows/misc.h"
@@ -191,6 +192,9 @@ namespace platf::dxgi {
   }
 
   capture_e display_wgc_ipc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    // Beam: WGC bakes the cursor in the helper's capture session regardless of
+    // cursor_visible — beacon the watcher so cursor_state stays pixel-truthful.
+    beam_wgc_last_snapshot_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     if (!_ipc_session) {
       return capture_e::error;
     }
@@ -434,6 +438,8 @@ namespace platf::dxgi {
   }
 
   capture_e display_wgc_ipc_ram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    // Beam: see the vram twin — WGC ignores cursor_visible; beacon for pixel truth.
+    beam_wgc_last_snapshot_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     if (!_ipc_session) {
       return capture_e::error;
     }

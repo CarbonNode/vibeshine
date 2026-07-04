@@ -35,6 +35,20 @@ extern bool display_cursor;
  */
 extern bool beam_effective_display_cursor;
 
+/**
+ * @brief Beam: last time (steady_clock ms) a WGC snapshot produced a frame.
+ *
+ * The WGC capture path composites the cursor inside the helper's
+ * Windows.Graphics.Capture session and IGNORES the per-frame cursor_visible flag — so
+ * while WGC is the live backend, frames contain the cursor no matter what
+ * beam_effective_display_cursor says. The cursor watcher treats "wgc snapshot within the
+ * last ~1.5s" as WGC-active and then reports cursor_state composited:true (pixel truth)
+ * instead of the flag value, plus logs a loud warning if suppression is being requested.
+ */
+#include <atomic>
+#include <cstdint>
+extern std::atomic<std::int64_t> beam_wgc_last_snapshot_ms;
+
 #ifdef _WIN32
   // Declare global singleton used for NVIDIA control panel modifications
   #include "platform/windows/nvprefs/nvprefs_interface.h"

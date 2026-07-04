@@ -9,6 +9,7 @@ safe::mail_t mail::man;
 thread_pool_util::ThreadPool task_pool;
 bool display_cursor = true;
 bool beam_effective_display_cursor = true;
+std::atomic<std::int64_t> beam_wgc_last_snapshot_ms {0};
 
 #ifdef _WIN32
 nvprefs::nvprefs_interface nvprefs_instance;
